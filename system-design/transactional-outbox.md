@@ -75,7 +75,8 @@ that.
 ```
 BEGIN
   INSERT INTO orders ...
-  INSERT INTO outbox (event_id, topic, payload, status) VALUES (..., 'PENDING')
+  INSERT INTO outbox (event_id, aggregate_id, topic, payload, status)
+    VALUES (..., 'order-7', ..., 'PENDING')
 COMMIT
 ```
 
@@ -90,8 +91,9 @@ A separate **relay** drains it:
    acting only in the success callback.
 3. Mark the row `SENT`.
 
-The relay is usually a poller. CDC (e.g. Debezium tailing the binlog) is the
-alternative when polling load or latency becomes a problem.
+The relay is usually a scheduled job inside the service itself, not a
+separate system. Running it is its own topic; see
+[Running the Relay](#running-the-relay).
 
 ---
 
@@ -111,13 +113,96 @@ The producer's part of that deal:
 - **Assign `event_id` at outbox insert time** and carry it in the message
   header. Every resend of that row carries the same ID, so the consumer can
   dedupe on it. An ID generated at send time is useless.
-- **`enable.idempotence=true` does not cover this.** Kafka's idempotent
-  producer only dedupes retries within one producer session. A restarted
-  relay gets a new producer ID, and the broker sees a new message.
+- **`enable.idempotence=true` is necessary but not sufficient.** It dedupes
+  network retries within one producer session. A restarted relay gets a new
+  producer ID, so resends after a restart look new to the broker. That gap
+  is what `event_id` covers.
+
+The producer can't close that gap itself. A relay that died before marking
+`SENT` can't tell whether the broker got the message, so it has to resend.
+Only the receiver can make the final call on duplicates.
 
 This is the same rule as [API idempotency](./api-idempotency.md): the
 record of intent and the business change have to commit together, or a
 crash between them leaves you guessing.
+
+---
+
+## Running the Relay
+
+### Ordering: where it actually breaks
+
+Order matters only **within one aggregate** (one order's `created` →
+`cancelled`), never across orders. Two different mechanisms protect two
+different legs:
+
+| Leg | Who keeps order | How |
+| --- | --- | --- |
+| outbox → broker | **the relay** | calls `send()` in outbox-id order, per aggregate |
+| broker → consumer | Kafka | key = `aggregate_id` → same partition; order holds only within a partition |
+
+Kafka keeps **arrival order**, not business order. A key doesn't help if
+the relay sent things in the wrong order to begin with.
+
+`enable.idempotence` is what keeps the first leg honest under retries: it
+numbers sends **per (producer, partition)** and rejects a gap, so one
+producer's `send()` order survives the client's internal retries. It knows
+nothing across producers. Two producers writing one partition interleave in
+whatever order they arrive.
+
+So with key and idempotence both set, order still breaks when the relay
+itself calls `send()` out of order:
+
+- **The relay skips a failed row.** id 10 (`created`) fails, the relay
+  leaves it `PENDING`, sends id 11 (`cancelled`), and picks up 10 on the
+  next poll. That resend is a new `send()` call, after 11. The client's
+  retries keep order; the application's retries don't. This happens with a
+  single relay.
+- **Two relays run at once.** Each service pod runs the scheduler, or a
+  rolling deploy briefly overlaps old and new. Two producers mean no order
+  between them. `SKIP LOCKED` stops them grabbing the same row, but that's
+  for efficiency, since consumers dedupe anyway. It does nothing for order;
+  it hands neighboring rows to different relays in parallel.
+
+### One relay is the default
+
+"Three relays" is usually three service pods that each happen to run the
+scheduler, not a throughput decision. Run **one active relay**: a single
+deployment, or a scheduler lock like ShedLock so only one pod runs it and
+the rest are standbys. That fixes the two-relay case. Batching (send a page
+asynchronously, wait for all acks, update in bulk) gets a single relay far
+past one-row-at-a-time. Measure before concluding one isn't enough.
+
+When it really isn't, the next step is usually **CDC** (Debezium reading
+the binlog/WAL), not hand-built sharding. The log is already one stream in
+commit order, so a single reader keeps order with no polling queries.
+Progress becomes one log position instead of per-row status, so it's still
+at-least-once. The cost moves to operations: if the reader stalls, MySQL
+may purge the binlog it needs, and Postgres keeps WAL until the disk fills.
+Splitting polling relays across fixed shards with leases is the last resort.
+
+### Failures: block the aggregate, not the relay
+
+Fix for the skipped-row case: when a row fails, **later rows of the same
+aggregate wait.** Other aggregates keep flowing. Blocking the whole batch
+on one failure stalls everything. The outbox needs an `aggregate_id` column
+for this.
+
+Then the row that never succeeds (payload over the broker's size limit,
+say). It blocks that order forever, and **nobody notices**: the broker never
+received it, so it has nothing to report. That's the silent "lost event"
+again, in a new shape. So:
+
+- Cap retries, then park the row in place as `FAILED` with the error.
+  A Kafka DLQ topic doesn't help when Kafka is the thing rejecting it.
+- **Keep the aggregate blocked.** Releasing id 11 without id 10 delivers a
+  cancel for an order that was never created.
+- Leave id 11 `PENDING`; don't mark it too. "Blocked" is derived from
+  "an earlier row of this aggregate is `FAILED`". Store the fact once, and
+  fixing id 10 unblocks the rest without touching them.
+- Alert on `FAILED` count and on the **age of the oldest `PENDING` row**.
+  The outbox only turns a silent loss into a visible delay if someone is
+  watching the delay.
 
 ---
 
