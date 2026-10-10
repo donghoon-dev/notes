@@ -236,6 +236,118 @@ update, so it doesn't settle the outbox case on its own.
 
 ---
 
+## Do You Need a Lock?
+
+### What the lock is protecting
+
+The lock key and the thing it protects are different. Find the second one
+by asking: **if two run at once, what exactly goes wrong, and where does it
+live?**
+
+| Case | Lock key | Protected thing | Where it lives |
+| --- | --- | --- | --- |
+| Outbox relay | `shedlock` row `outboxRelay` | outbox row status, message order | DB rows + **Kafka** |
+| Settlement | none needed | per-merchant-day status, **the payout** | DB rows + **payout API** |
+| Payment | `payment:order-7` | order status, **the charge** | DB rows + **PG** |
+| Cache refresh | `cache:product-1` | DB load only | nowhere; overlap is waste |
+
+Protected things come in two kinds, and most real jobs have both:
+
+- **State in your DB.** The row itself can be the lock: a conditional
+  state change, a `UNIQUE` constraint, an optimistic `version`. The DB
+  enforces it, and no separate lock is needed.
+- **Side effects outside it.** Payouts, charges, Kafka sends, email. No DB
+  lock reaches them. Only the receiver can reject a duplicate.
+
+### Example: daily settlement on three pods
+
+A `@Scheduled` job pays out each of 10,000 merchants for the day. All three
+pods run it. Each merchant-day must be paid **exactly once**.
+
+**Partitioning doesn't settle it.** `merchant_id % 3 == my index` splits
+the work, but:
+
+- Deployment pods have random names and no index. Something has to assign
+  one.
+- The pod count changes mid-run (rolling update, autoscaling). Old pods
+  compute `% 3` and new ones `% 4`, so merchant 6 belongs to old pod 0 and
+  new pod 2 at once.
+- A pod that's down at midnight leaves a third of merchants unpaid. Handing
+  its slot to someone means deciding it's dead, which is a timeout.
+
+Assigning slots dynamically is a lease again (Kafka's consumer group is
+exactly that). Partitioning moves the ownership question; it doesn't remove
+it.
+
+**Make the row the lock.** Claim before doing anything:
+
+```sql
+UPDATE settlement
+SET status = 'PROCESSING', processing_started_at = now()
+WHERE merchant_id = 6 AND settle_date = '2026-10-09' AND status = 'PENDING';
+-- 1 row: mine → payout → DONE.  0 rows: someone else has it, skip.
+```
+
+This is ShedLock's acquire applied to the protected row itself:
+
+| | ShedLock | Conditional state change |
+| --- | --- | --- |
+| Lock lives in | a separate `shedlock` row | the protected row |
+| Expiry | by time | none |
+| Code that skips the lock | touches the outbox freely | can't; the claim is the row's state |
+| Parallelism | one pod runs the whole job | pods split merchants row by row |
+
+**Check before the side effect, not after.** Calling the payout first and
+then running `UPDATE ... WHERE token = ?` only protects the status column.
+Two pods have already paid. And putting the external call inside the DB
+transaction doesn't help: it holds the connection and row lock for the
+length of the call, and a rollback doesn't take the money back.
+
+**A claimer that dies leaves the row `PROCESSING` forever.** Recovery
+needs a threshold:
+
+```sql
+UPDATE settlement SET status = 'PENDING'
+WHERE status = 'PROCESSING'
+  AND processing_started_at < now() - INTERVAL 30 MINUTE;
+```
+
+That's a lease, rebuilt inside the row. Whatever the design, if the owner
+can die, something has to give up on it after a timeout, because a dead
+process and a slow one look the same from outside.
+
+**So the original claimer may still be alive.** It wakes after 30 minutes
+and finishes its payout while the retry does the same. What stops the
+double payment is the payout API's **idempotency key**, built from the
+business identity (`merchant 6 + 2026-10-09`). A key generated per call
+changes on every retry and stops nothing. This is the same reason the
+outbox `event_id` is assigned at insert time.
+
+### Three roles
+
+A distributed lock packages three roles, and only ships two of them:
+
+| Role | Distributed lock | Settlement without one |
+| --- | --- | --- |
+| Only one proceeds (efficiency) | acquire the lease | `PENDING → PROCESSING` |
+| A dead owner gets replaced (liveness) | lease expiry | the 30-minute threshold |
+| Overlap is still safe (safety) | fencing token, **not built in** | payout idempotency key |
+
+Unpacking the lock doesn't remove the first two roles; you build them on
+the row. The third is the one that makes "exactly once" true, and no
+design gets to skip it.
+
+A separate distributed lock earns its place when the protected thing
+isn't a row:
+
+- Work that isn't per-entity, like a whole-table cleanup. This is why
+  ShedLock locks by job name.
+- An external system's capacity, like a legacy service that takes one
+  session at a time.
+- Overlap that only wastes work, like a cache refresh.
+
+---
+
 ## When to Use What
 
 Ask: **if two holders run at once, what breaks?**
