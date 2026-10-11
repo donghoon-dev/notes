@@ -318,10 +318,9 @@ process and a slow one look the same from outside.
 
 **So the original claimer may still be alive.** It wakes after 30 minutes
 and finishes its payout while the retry does the same. What stops the
-double payment is the payout API's **idempotency key**, built from the
-business identity (`merchant 6 + 2026-10-09`). A key generated per call
-changes on every retry and stops nothing. This is the same reason the
-outbox `event_id` is assigned at insert time.
+double payment is the payout API's **idempotency key**. How to build that
+key, and what to do when the API doesn't take one, is in
+[exactly-once](./exactly-once.md#finding-out-what-happened).
 
 ### Three roles
 
